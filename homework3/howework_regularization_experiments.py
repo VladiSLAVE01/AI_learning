@@ -10,16 +10,18 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     train_loader, test_loader = get_mnist_loaders()
-    hidden_layers_list = [
-        [64, 32, 16],
-        [256, 128, 64],
-        [1024, 512, 256],
-        [2048, 1024, 512],
+    hidden_layers = [256, 128, 64]
+    config = [
+        [False, 0, 0],
+        [False, 0.5, 0],
+        [True, 0, 0],
+        [True, 0.5, 0],
+        [False, 0, 1e-4]
     ]
 
-    for i, hidden_layers in enumerate(hidden_layers_list):
-        history, train_time = experiment(hidden_layers, train_loader, test_loader, device)
-        plot_training_history(history, f'results/width_experiments/width_{i + 1}.png')
+    for i, (use_batch_norm, dropout_p, l2_weight_decay) in enumerate(config):
+        history, train_time = experiment(hidden_layers, train_loader, test_loader, device, use_batch_norm, dropout_p, l2_weight_decay)
+        plot_training_history(history, f'results/regularization_experiments/regularization_{i + 1}.png')
         logging.info(f'Время обучения: {train_time:.2f}')
         logging.info(
             f'Финальная train accuracy: {history["train_accuracies"][-1]:.4f}, test accuracy: {history["test_accuracies"][-1]:.4f}')
