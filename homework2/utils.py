@@ -1,70 +1,114 @@
-import torch
+# Общие утилиты
+
+
+from __future__ import annotations
+
+import logging
+import random
+from pathlib import Path
+from typing import Mapping, Sequence
+
+import matplotlib
+
+matplotlib.use("Agg")  
+import matplotlib.pyplot as plt
 import numpy as np
-from torch.utils.data import Dataset
+import torch
 
-class RegressionDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = X
-        self.y = y
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+MODELS_DIR = BASE_DIR / "models"
+PLOTS_DIR = BASE_DIR / "plots"
 
-    def __len__(self):
-        return len(self.X)
+for _directory in (DATA_DIR, MODELS_DIR, PLOTS_DIR):
+    _directory.mkdir(parents=True, exist_ok=True)
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
 
-class ClassificationDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = X
-        self.y = y
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    def __len__(self):
-        return len(self.X)
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def make_regression_data(n=100, noise=0.1, source='random'):
-    if source == 'random':
-        X = torch.rand(n, 1)
-        w, b = 2.0, -1.0
-        y = w * X + b + noise * torch.randn(n, 1)
-        return X, y
-    elif source == 'diabetes':
-        from sklearn.datasets import load_diabetes
-        data = load_diabetes()
-        X = torch.tensor(data['data'], dtype=torch.float32)
-        y = torch.tensor(data['target'], dtype=torch.float32).unsqueeze(1)
-        return X, y
-    else:
-        raise ValueError('Unknown source')
 
-def make_classification_data(n=100, source='random'):
-    if source == 'random':
-        X = torch.rand(n, 2)
-        w = torch.tensor([2.0, -3.0])
-        b = 0.5
-        logits = X @ w + b
-        y = (logits > 0).float().unsqueeze(1)
-        return X, y
-    elif source == 'breast_cancer':
-        from sklearn.datasets import load_breast_cancer
-        data = load_breast_cancer()
-        X = torch.tensor(data['data'], dtype=torch.float32)
-        y = torch.tensor(data['target'], dtype=torch.float32).unsqueeze(1)
-        return X, y
-    else:
-        raise ValueError('Unknown source')
+def get_logger(name: str) -> logging.Logger:
+    """Создаёт или возвращает готовый логгер с единым форматом вывода
 
-def mse(y_pred, y_true):
-    return ((y_pred - y_true) ** 2).mean().item()
+    Повторные вызовы с тем же name не добавляют дублирующих обработчиков
+    """
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return logger
 
-def accuracy(y_pred, y_true):
-    y_pred_bin = (y_pred > 0.5).float()
-    return (y_pred_bin == y_true).float().mean().item()
 
-def log_epoch(epoch, loss, **metrics):
-    msg = f"Epoch {epoch}: loss={loss:.4f}"
-    for k, v in metrics.items():
-        msg += f", {k}={v:.4f}"
-    print(msg)
+def plot_curves(
+    history: Mapping[str, Sequence[float]],
+    title: str,
+    ylabel: str,
+    save_path: Path | str,
+    xlabel: str = "Эпоха",
+    logy: bool = False,
+) -> Path:
+    "Рисует несколько кривых на одном графике и сохраняет его в файл"
+    save_path = Path(save_path)
+    plt.figure(figsize=(8, 5))
+    for label, values in history.items():
+        plt.plot(range(1, len(values) + 1), values, label=label)
+    if logy:
+        plt.yscale("log")
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120)
+    plt.close()
+    return save_path
+
+
+def plot_bars(
+    values: Mapping[str, float],
+    title: str,
+    ylabel: str,
+    save_path: Path | str,
+    xlabel: str = "",
+) -> Path:
+    "Строит столбчатую диаграмму по словарю {подпись: значение}"
+    save_path = Path(save_path)
+    plt.figure(figsize=(8, 5))
+    labels = list(values.keys())
+    heights = list(values.values())
+    bars = plt.bar(labels, heights, color="#4C72B0")
+    for bar, height in zip(bars, heights):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            height,
+            f"{height:.4g}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.xticks(rotation=15)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120)
+    plt.close()
+    return save_path

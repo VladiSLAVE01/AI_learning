@@ -1,977 +1,618 @@
-"""
-homework_model_modification.py
-Задание 1: Модификация существующих моделей
+"""Задание 1: Модификация существующих моделей
 
-1.1 Линейная регрессия с L1/L2 регуляризацией и Early Stopping
-1.2 Логистическая регрессия с поддержкой многоклассовой классификации
-    и метриками (precision, recall, F1, ROC-AUC, confusion matrix)
+Расширение базовой линейной и логистической регрессии из regression_basics:
+
+1.1 Линейная регрессия
+     L1- и L2-регуляризация (реализованы вручную как добавка к функции потерь);
+     ранняя остановка (early stopping) по валидационной ошибке с
+     восстановлением лучших весов.
+
+1.2 Логистическая регрессия
+    поддержка многоклассовой классификации (softmax + CrossEntropyLoss);
+    метрики precision, recall, F1-score и ROC-AUC, реализованные с нуля
+    (проверяются на совпадение с scikit-learn в test_homework.py);
+    визуализация confusion matrix.
+
+Функции и классы модуля переиспользуются в заданиях 2 и 3
 """
 
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, Sequence
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import confusion_matrix, roc_auc_score, precision_score, recall_score, f1_score, accuracy_score
-from sklearn.preprocessing import label_binarize
-import logging
-import os
-from typing import Dict, List, Tuple, Optional, Any
+from torch.utils.data import DataLoader, TensorDataset
 
-# Импортируем из utils.py
 from utils import (
-    make_regression_data,
-    make_classification_data,
-    RegressionDataset,
-    ClassificationDataset,
-    mse,
-    accuracy,
-    log_epoch
+    BASE_DIR,
+    MODELS_DIR,
+    PLOTS_DIR,
+    get_device,
+    get_logger,
+    plot_curves,
+    set_seed,
 )
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('training.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+logger = get_logger("model_modification")
 
 
-# ==================== 1.1 ЛИНЕЙНАЯ РЕГРЕССИЯ С РЕГУЛЯРИЗАЦИЕЙ ====================
+#  Модели 
+class LinearRegressionModel(nn.Module):
+    "Линейная регрессия y = Wx + b на базе nn.Linear"
 
-class LinearRegressionManual:
-    """
-    Линейная регрессия с L1 и L2 регуляризацией (ручная реализация).
+    def __init__(self, in_features: int, out_features: int = 1):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
 
-    Использует функции из utils.py:
-    - mse() для вычисления ошибки
-    - log_epoch() для логирования
-    """
-    def __init__(self, in_features: int, l1_lambda: float = 0.0, l2_lambda: float = 0.0):
-        """
-        Args:
-            in_features: Количество входных признаков
-            l1_lambda: Коэффициент L1 регуляризации (Lasso)
-            l2_lambda: Коэффициент L2 регуляризации (Ridge)
-        """
-        self.w = torch.randn(in_features, 1, dtype=torch.float32, requires_grad=False)
-        self.b = torch.zeros(1, dtype=torch.float32, requires_grad=False)
-        self.l1_lambda = l1_lambda
-        self.l2_lambda = l2_lambda
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
 
-        # Для early stopping
-        self.best_w = None
-        self.best_b = None
-        self.best_val_loss = float('inf')
 
-        logger.info(f"LinearRegressionManual: in_features={in_features}, "
-                   f"l1={l1_lambda}, l2={l2_lambda}")
+class LogisticRegressionModel(nn.Module):
+    "Логистическая (softmax) регрессия для K классов"
 
-    def __call__(self, X: torch.Tensor) -> torch.Tensor:
-        """Прямой проход: y = X @ w + b."""
-        return X @ self.w + self.b
+    def __init__(self, in_features: int, num_classes: int):
+        super().__init__()
+        self.num_classes = num_classes
+        self.linear = nn.Linear(in_features, num_classes)
 
-    def parameters(self):
-        """Возвращает параметры модели."""
-        return [self.w, self.b]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
 
-    def zero_grad(self):
-        """Обнуление градиентов."""
-        self.dw = torch.zeros_like(self.w)
-        self.db = torch.zeros_like(self.b)
 
-    def backward(self, X: torch.Tensor, y: torch.Tensor, y_pred: torch.Tensor):
-        """
-        Обратный проход с вычислением градиентов.
-        Включает градиенты от L1 и L2 регуляризации.
-        """
-        n = X.shape[0]
-        error = y_pred - y
+#  1.1 Регуляризация и ранняя остановка 
+def l1_penalty(model: nn.Module) -> torch.Tensor:
+    "Сумма модулей весов (без смещений) - штраф L1, ведущий к разреженности"
+    return sum(
+        param.abs().sum()
+        for name, param in model.named_parameters()
+        if name.endswith("weight")
+    )
 
-        # Градиенты от MSE (используем формулу из utils)
-        dw_mse = (X.T @ error) / n
-        db_mse = error.mean(0)
 
-        # Градиенты от L1 регуляризации (Lasso)
-        if self.l1_lambda > 0:
-            dw_l1 = self.l1_lambda * torch.sign(self.w)
-        else:
-            dw_l1 = 0
-
-        # Градиенты от L2 регуляризации (Ridge)
-        if self.l2_lambda > 0:
-            dw_l2 = self.l2_lambda * 2 * self.w
-        else:
-            dw_l2 = 0
-
-        # Суммарные градиенты
-        self.dw = dw_mse + dw_l1 + dw_l2
-        self.db = db_mse
-
-    def step(self, lr: float):
-        """Обновление параметров."""
-        self.w -= lr * self.dw
-        self.b -= lr * self.db
-
-    def compute_loss(self, X: torch.Tensor, y: torch.Tensor) -> float:
-        """
-        Вычисление полной функции потерь с регуляризацией.
-        Использует mse() из utils.
-        """
-        y_pred = self(X)
-        mse_loss = mse(y_pred, y)
-
-        # L1 регуляризация
-        l1_loss = self.l1_lambda * torch.abs(self.w).sum().item()
-
-        # L2 регуляризация
-        l2_loss = self.l2_lambda * (self.w ** 2).sum().item()
-
-        return mse_loss + l1_loss + l2_loss
-
-    def compute_mse(self, X: torch.Tensor, y: torch.Tensor) -> float:
-        """Вычисление только MSE без регуляризации. Использует mse() из utils."""
-        y_pred = self(X)
-        return mse(y_pred, y)
-
-    def save_best(self):
-        """Сохраняет текущие веса как лучшие."""
-        self.best_w = self.w.clone()
-        self.best_b = self.b.clone()
-
-    def restore_best(self):
-        """Восстанавливает лучшие веса."""
-        if self.best_w is not None:
-            self.w = self.best_w.clone()
-            self.b = self.best_b.clone()
-            logger.info("Restored best model weights")
-
-    def save(self, path: str):
-        """Сохранение модели."""
-        torch.save({
-            'w': self.w,
-            'b': self.b,
-            'best_w': self.best_w,
-            'best_b': self.best_b,
-            'best_val_loss': self.best_val_loss,
-            'l1_lambda': self.l1_lambda,
-            'l2_lambda': self.l2_lambda
-        }, path)
-        logger.info(f"Model saved to {path}")
-
-    def load(self, path: str):
-        """Загрузка модели."""
-        state = torch.load(path)
-        self.w = state['w']
-        self.b = state['b']
-        self.best_w = state.get('best_w')
-        self.best_b = state.get('best_b')
-        self.best_val_loss = state.get('best_val_loss', float('inf'))
-        logger.info(f"Model loaded from {path}")
+def l2_penalty(model: nn.Module) -> torch.Tensor:
+    "Сумма квадратов весов (без смещений) - штраф L2"
+    return sum(
+        param.pow(2).sum()
+        for name, param in model.named_parameters()
+        if name.endswith("weight")
+    )
 
 
 class EarlyStopping:
-    """
-    Ранняя остановка обучения.
+    """Ранняя остановка обучения по валидационной метрике.
 
-    Отслеживает валидационную ошибку и останавливает обучение,
-    если ошибка не улучшается в течение заданного количества эпох.
+    Отслеживает лучшее значение loss; если оно не улучшается на min_delta
+    в течение patience эпох подряд - сигнализирует об остановке. При
+    restore_best=True сохраняет и по запросу возвращает лучшие веса.
     """
-    def __init__(self, patience: int = 10, min_delta: float = 1e-4):
-        """
-        Args:
-            patience: Количество эпох без улучшения до остановки
-            min_delta: Минимальное изменение для считания улучшением
-        """
+
+    def __init__(self, patience: int = 15, min_delta: float = 1e-4, restore_best: bool = True):
         self.patience = patience
         self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
+        self.restore_best = restore_best
+        self.best_loss = float("inf")
         self.best_epoch = 0
+        self.counter = 0
+        self.should_stop = False
+        self._best_state: Dict[str, torch.Tensor] | None = None
 
-        logger.info(f"EarlyStopping: patience={patience}, min_delta={min_delta}")
-
-    def __call__(self, val_loss: float, epoch: int) -> bool:
-        """
-        Проверка условия остановки.
-
-        Args:
-            val_loss: Текущее значение валидационной потери
-            epoch: Номер текущей эпохи
-
-        Returns:
-            True если нужно остановить обучение
-        """
-        if self.best_loss is None:
-            self.best_loss = val_loss
-            self.best_epoch = epoch
-            return False
-
+    def step(self, val_loss: float, model: nn.Module, epoch: int) -> bool:
+        "Обновляет состояние по итогам эпохи, возвращает флаг остановки"
         if val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
             self.best_epoch = epoch
             self.counter = 0
-            return False
+            if self.restore_best:
+                self._best_state = {
+                    k: v.detach().clone() for k, v in model.state_dict().items()
+                }
         else:
             self.counter += 1
             if self.counter >= self.patience:
-                self.early_stop = True
-                logger.info(f"Early stopping! Best loss: {self.best_loss:.6f} at epoch {self.best_epoch}")
-                return True
-        return False
+                self.should_stop = True
+        return self.should_stop
+
+    def restore(self, model: nn.Module) -> None:
+        "Загружает в модель лучшие веса, зафиксированные во время обучения"
+        if self.restore_best and self._best_state is not None:
+            model.load_state_dict(self._best_state)
+
+
+@torch.no_grad()
+def evaluate_regression(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+    "Считает MSE, MAE и R^2 регрессионной модели на переданном загрузчике"
+    model.eval()
+    preds, targets = [], []
+    for xb, yb in loader:
+        preds.append(model(xb.to(device)).cpu())
+        targets.append(yb)
+    preds = torch.cat(preds)
+    targets = torch.cat(targets)
+    mse = ((preds - targets) ** 2).mean().item()
+    mae = (preds - targets).abs().mean().item()
+    ss_res = ((targets - preds) ** 2).sum()
+    ss_tot = ((targets - targets.mean()) ** 2).sum() + 1e-12
+    r2 = (1 - ss_res / ss_tot).item()
+    return {"mse": mse, "mae": mae, "r2": r2}
 
 
 def train_linear_regression(
-    model: LinearRegressionManual,
+    model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    epochs: int = 100,
-    lr: float = 0.1,
-    use_regularization: bool = True,
-    early_stopping: Optional[EarlyStopping] = None,
-    save_path: Optional[str] = None,
-    verbose: bool = True
-) -> Dict[str, List]:
-    """
-    Обучение линейной регрессии с регуляризацией и ранней остановкой.
-
-    Использует:
-    - log_epoch() из utils для логирования
-    - mse() из utils для вычисления ошибки
-
-    Args:
-        model: Модель для обучения
-        train_loader: Загрузчик тренировочных данных
-        val_loader: Загрузчик валидационных данных
-        epochs: Количество эпох
-        lr: Скорость обучения
-        use_regularization: Использовать регуляризацию
-        early_stopping: Объект ранней остановки
-        save_path: Путь для сохранения модели
-        verbose: Выводить логи
-
-    Returns:
-        Словарь с историей обучения
-    """
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_mse': [],
-        'val_mse': []
-    }
-
-    logger.info(f"Starting training for {epochs} epochs...")
-    if use_regularization:
-        logger.info(f"Using regularization: L1={model.l1_lambda}, L2={model.l2_lambda}")
+    *,
+    epochs: int = 300,
+    lr: float = 0.05,
+    l1_lambda: float = 0.0,
+    l2_lambda: float = 0.0,
+    patience: int = 20,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> Dict[str, list]:
+    "Обучает линейную регрессию с L1/L2-регуляризацией и ранней остановкой"
+    device = device or get_device()
+    model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.SGD(model.parameters(), lr=lr)
+    stopper = EarlyStopping(patience=patience)
+    history: Dict[str, list] = {"train_loss": [], "val_loss": []}
 
     for epoch in range(1, epochs + 1):
-        # Training phase
-        train_loss = 0.0
-        train_mse_sum = 0.0
-        n_batches = 0
+        model.train()
+        running = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            pred = model(xb)
+            data_loss = criterion(pred, yb)
+            loss = data_loss
+            if l1_lambda:
+                loss = loss + l1_lambda * l1_penalty(model)
+            if l2_lambda:
+                loss = loss + l2_lambda * l2_penalty(model)
+            loss.backward()
+            optimizer.step()
+            running += data_loss.item() * xb.size(0)  
 
-        for X, y in train_loader:
-            y_pred = model(X)
+        train_loss = running / len(train_loader.dataset)
+        val_loss = evaluate_regression(model, val_loader, device)["mse"]
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
 
-            # Вычисляем MSE (используем mse из utils)
-            mse_loss = mse(y_pred, y)
+        if verbose and (epoch % 20 == 0 or epoch == 1):
+            logger.info("Эпоха %3d | train MSE=%.4f | val MSE=%.4f", epoch, train_loss, val_loss)
 
-            # Вычисляем полную потерю с регуляризацией
-            if use_regularization:
-                l1_loss = model.l1_lambda * torch.abs(model.w).sum().item()
-                l2_loss = model.l2_lambda * (model.w ** 2).sum().item()
-                total_loss = mse_loss + l1_loss + l2_loss
-            else:
-                total_loss = mse_loss
+        if stopper.step(val_loss, model, epoch):
+            logger.info(
+                "Ранняя остановка на эпохе %d (лучшая эпоха %d, val MSE=%.4f)",
+                epoch, stopper.best_epoch, stopper.best_loss,
+            )
+            break
 
-            # Backward и шаг оптимизации
-            model.zero_grad()
-            model.backward(X, y, y_pred)
-            model.step(lr)
-
-            train_loss += total_loss
-            train_mse_sum += mse_loss
-            n_batches += 1
-
-        avg_train_loss = train_loss / n_batches
-        avg_train_mse = train_mse_sum / n_batches
-
-        # Validation phase
-        val_loss = 0.0
-        val_mse_sum = 0.0
-        n_val_batches = 0
-
-        for X, y in val_loader:
-            y_pred = model(X)
-            mse_loss = mse(y_pred, y)
-
-            if use_regularization:
-                l1_loss = model.l1_lambda * torch.abs(model.w).sum().item()
-                l2_loss = model.l2_lambda * (model.w ** 2).sum().item()
-                total_loss = mse_loss + l1_loss + l2_loss
-            else:
-                total_loss = mse_loss
-
-            val_loss += total_loss
-            val_mse_sum += mse_loss
-            n_val_batches += 1
-
-        avg_val_loss = val_loss / n_val_batches
-        avg_val_mse = val_mse_sum / n_val_batches
-
-        # Сохранение истории
-        history['train_loss'].append(avg_train_loss)
-        history['val_loss'].append(avg_val_loss)
-        history['train_mse'].append(avg_train_mse)
-        history['val_mse'].append(avg_val_mse)
-
-        # Сохранение лучшей модели
-        if avg_val_loss < model.best_val_loss:
-            model.best_val_loss = avg_val_loss
-            model.save_best()
-            if save_path:
-                model.save(save_path)
-
-        # Early stopping
-        if early_stopping:
-            if early_stopping(avg_val_loss, epoch):
-                model.restore_best()
-                break
-
-        # Логирование (используем log_epoch из utils)
-        if epoch % 10 == 0 and verbose:
-            log_epoch(epoch, avg_train_loss,
-                     val_loss=avg_val_loss,
-                     train_mse=avg_train_mse,
-                     val_mse=avg_val_mse)
-
-    logger.info("Training completed!")
+    stopper.restore(model)
+    history["best_epoch"] = stopper.best_epoch or len(history["train_loss"])
     return history
 
 
-# ==================== 1.2 ЛОГИСТИЧЕСКАЯ РЕГРЕССИЯ (МНОГОКЛАССОВАЯ) ====================
+# 1.2 Метрики классификации
+def confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, num_classes: int) -> np.ndarray:
 
-class LogisticRegressionMulticlass(nn.Module):
+    "Матрица ошибок cm[i, j] = число объектов класса i, предсказанных как j"
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    cm = np.zeros((num_classes, num_classes), dtype=int)
+    np.add.at(cm, (y_true, y_pred), 1)
+    return cm
+
+
+def precision_recall_f1(cm: np.ndarray) -> Dict[str, float]:
+    """Macro усредненные precision, recall и F1 по матрице ошибок
+
+    Для каждого класса c:
+        precision = TP / (TP + FP),  recall = TP / (TP + FN),
+        F1 = 2 * precision * recall / (precision + recall)
     """
-    Логистическая регрессия для многоклассовой классификации (PyTorch версия).
+    tp = np.diag(cm).astype(float)
+    fp = cm.sum(axis=0) - tp
+    fn = cm.sum(axis=1) - tp
 
-    Поддерживает:
-    - Бинарную классификацию (2 класса)
-    - Многоклассовую классификацию (> 2 классов)
-
-    Использует:
-    - accuracy() из utils для вычисления точности
-    """
-    def __init__(self, in_features: int, num_classes: int = 2, l2_lambda: float = 0.0):
-        """
-        Args:
-            in_features: Количество входных признаков
-            num_classes: Количество классов
-            l2_lambda: Коэффициент L2 регуляризации
-        """
-        super().__init__()
-        self.linear = nn.Linear(in_features, num_classes)
-        self.num_classes = num_classes
-        self.l2_lambda = l2_lambda
-
-        logger.info(f"LogisticRegressionMulticlass: in_features={in_features}, "
-                   f"num_classes={num_classes}, l2={l2_lambda}")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Прямой проход. Возвращает логиты."""
-        return self.linear(x)
-
-    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """Возвращает вероятности классов."""
-        logits = self.forward(x)
-        if self.num_classes == 2:
-            return torch.sigmoid(logits)
-        else:
-            return torch.softmax(logits, dim=1)
-
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """Возвращает предсказанные классы."""
-        logits = self.forward(x)
-        return torch.argmax(logits, dim=1)
-
-    def regularization_loss(self) -> torch.Tensor:
-        """Вычисление L2 регуляризационного штрафа."""
-        return self.l2_lambda * sum((p ** 2).sum() for p in self.parameters())
+    with np.errstate(divide="ignore", invalid="ignore"):
+        precision = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
+        recall = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
+        f1 = np.where(
+            precision + recall > 0,
+            2 * precision * recall / (precision + recall),
+            0.0,
+        )
+    return {
+        "precision": float(precision.mean()),
+        "recall": float(recall.mean()),
+        "f1": float(f1.mean()),
+    }
 
 
-class LogisticRegressionManualMulticlass:
-    """
-    Логистическая регрессия для многоклассовой классификации (ручная реализация).
-
-    Поддерживает:
-    - Бинарную классификацию (2 класса)
-    - Многоклассовую классификацию (> 2 классов)
-
-    Использует:
-    - accuracy() из utils для вычисления точности
-    """
-    def __init__(self, in_features: int, num_classes: int = 2, l2_lambda: float = 0.0):
-        """
-        Args:
-            in_features: Количество входных признаков
-            num_classes: Количество классов
-            l2_lambda: Коэффициент L2 регуляризации
-        """
-        self.W = torch.randn(in_features, num_classes, dtype=torch.float32, requires_grad=False)
-        self.b = torch.zeros(num_classes, dtype=torch.float32, requires_grad=False)
-        self.num_classes = num_classes
-        self.l2_lambda = l2_lambda
-
-        # Для early stopping
-        self.best_W = None
-        self.best_b = None
-        self.best_val_loss = float('inf')
-
-        logger.info(f"LogisticRegressionManualMulticlass: in_features={in_features}, "
-                   f"num_classes={num_classes}, l2={l2_lambda}")
-
-    def __call__(self, X: torch.Tensor) -> torch.Tensor:
-        """Прямой проход. Возвращает вероятности."""
-        logits = X @ self.W + self.b
-        if self.num_classes == 2:
-            return torch.sigmoid(logits)
-        else:
-            return torch.softmax(logits, dim=1)
-
-    def logits(self, X: torch.Tensor) -> torch.Tensor:
-        """Возвращает логиты."""
-        return X @ self.W + self.b
-
-    def parameters(self):
-        return [self.W, self.b]
-
-    def zero_grad(self):
-        self.dW = torch.zeros_like(self.W)
-        self.db = torch.zeros_like(self.b)
-
-    def backward(self, X: torch.Tensor, y: torch.Tensor, y_pred: torch.Tensor):
-        """
-        Обратный проход с вычислением градиентов.
-
-        Args:
-            X: Входные данные (batch_size, in_features)
-            y: Целевые метки (batch_size, 1)
-            y_pred: Предсказания (batch_size, num_classes)
-        """
-        n = X.shape[0]
-
-        if self.num_classes == 2:
-            # Бинарная классификация
-            y = y.squeeze()
-            error = y_pred - y
-            self.dW = (X.T @ error) / n
-            self.db = error.mean(0)
-        else:
-            # Многоклассовая классификация
-            y_one_hot = torch.zeros(n, self.num_classes)
-            y_one_hot.scatter_(1, y.long(), 1)
-            error = y_pred - y_one_hot
-            self.dW = (X.T @ error) / n
-            self.db = error.mean(0)
-
-        # L2 регуляризация
-        if self.l2_lambda > 0:
-            self.dW += self.l2_lambda * 2 * self.W
-
-    def step(self, lr: float):
-        self.W -= lr * self.dW
-        self.b -= lr * self.db
-
-    def predict(self, X: torch.Tensor) -> torch.Tensor:
-        """Предсказание классов."""
-        logits = X @ self.W + self.b
-        return torch.argmax(logits, dim=1)
-
-    def predict_proba(self, X: torch.Tensor) -> torch.Tensor:
-        """Возвращает вероятности классов."""
-        logits = X @ self.W + self.b
-        if self.num_classes == 2:
-            return torch.sigmoid(logits)
-        else:
-            return torch.softmax(logits, dim=1)
-
-    def save_best(self):
-        self.best_W = self.W.clone()
-        self.best_b = self.b.clone()
-
-    def restore_best(self):
-        if self.best_W is not None:
-            self.W = self.best_W.clone()
-            self.b = self.best_b.clone()
-
-    def save(self, path: str):
-        torch.save({
-            'W': self.W,
-            'b': self.b,
-            'best_W': self.best_W,
-            'best_b': self.best_b,
-            'best_val_loss': self.best_val_loss,
-            'num_classes': self.num_classes,
-            'l2_lambda': self.l2_lambda
-        }, path)
-        logger.info(f"Model saved to {path}")
-
-    def load(self, path: str):
-        state = torch.load(path)
-        self.W = state['W']
-        self.b = state['b']
-        self.best_W = state.get('best_W')
-        self.best_b = state.get('best_b')
-        self.best_val_loss = state.get('best_val_loss', float('inf'))
-        self.num_classes = state['num_classes']
-        self.l2_lambda = state.get('l2_lambda', 0.0)
+def _rankdata(values: np.ndarray) -> np.ndarray:
+    "Ранги значений (1..n) со средним рангом для совпадающих элементов"
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=float)
+    ranks[order] = np.arange(1, len(values) + 1)
+    sorted_values = values[order]
+    i = 0
+    n = len(values)
+    while i < n:
+        j = i
+        while j + 1 < n and sorted_values[j + 1] == sorted_values[i]:
+            j += 1
+        if j > i:
+            ranks[order[i : j + 1]] = (i + 1 + j + 1) / 2.0
+        i = j + 1
+    return ranks
 
 
-# ==================== МЕТРИКИ ДЛЯ КЛАССИФИКАЦИИ ====================
+def _binary_roc_auc(y_true_bin: np.ndarray, scores: np.ndarray) -> float:
+    "ROC-AUC для бинарной задачи через статистику Манна–Уитни"
+    y_true_bin = np.asarray(y_true_bin).astype(int)
+    n_pos = int(y_true_bin.sum())
+    n_neg = len(y_true_bin) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan") 
+    ranks = _rankdata(scores)
+    sum_ranks_pos = ranks[y_true_bin == 1].sum()
+    return (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
-def calculate_classification_metrics(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    y_prob: Optional[np.ndarray] = None
-) -> Dict[str, float]:
-    """
-    Вычисление полного набора метрик классификации.
 
-    Использует функции из sklearn:
-    - accuracy_score
-    - precision_score
-    - recall_score
-    - f1_score
-    - roc_auc_score
+def roc_auc_score(y_true: np.ndarray, scores: np.ndarray, num_classes: int) -> float:
+    "ROC-AUC. Для K>2 - one-vs-rest с macro-усреднением"
+    y_true = np.asarray(y_true).astype(int)
+    scores = np.asarray(scores, dtype=float)
+    if num_classes == 2:
+        return _binary_roc_auc((y_true == 1).astype(int), scores[:, 1])
+    aucs = [
+        _binary_roc_auc((y_true == c).astype(int), scores[:, c])
+        for c in range(num_classes)
+    ]
+    aucs = [a for a in aucs if not np.isnan(a)]
+    return float(np.mean(aucs)) if aucs else float("nan")
 
-    Args:
-        y_true: Истинные метки (n_samples,)
-        y_pred: Предсказанные метки (n_samples,)
-        y_prob: Вероятности (n_samples, n_classes) для ROC-AUC
 
-    Returns:
-        Словарь с метриками: accuracy, precision, recall, f1, roc_auc
-    """
-    metrics = {}
+@torch.no_grad()
+def evaluate_classification(
+    model: nn.Module, loader: DataLoader, num_classes: int, device: torch.device
+) -> Dict[str, object]:
+    "Полная оценка классификатора: accuracy, precision, recall, F1, ROC-AUC, cm"
+    model.eval()
+    logits_all, targets_all = [], []
+    for xb, yb in loader:
+        logits_all.append(model(xb.to(device)).cpu())
+        targets_all.append(yb.view(-1))
+    logits = torch.cat(logits_all)
+    targets = torch.cat(targets_all).long().numpy()
+    probs = torch.softmax(logits, dim=1).numpy()
+    preds = probs.argmax(axis=1)
 
-    # Accuracy
-    metrics['accuracy'] = accuracy_score(y_true, y_pred)
-
-    # Precision, Recall, F1 (weighted average для многоклассовой)
-    metrics['precision'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-    metrics['recall'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-    metrics['f1'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-
-    # ROC-AUC
-    if y_prob is not None:
-        n_classes = len(np.unique(y_true))
-        if n_classes == 2:
-            # Бинарная классификация
-            if y_prob.ndim == 2 and y_prob.shape[1] == 2:
-                y_prob_class1 = y_prob[:, 1]
-            else:
-                y_prob_class1 = y_prob.flatten()
-            try:
-                metrics['roc_auc'] = roc_auc_score(y_true, y_prob_class1)
-            except ValueError:
-                metrics['roc_auc'] = 0.5
-        else:
-            # Многоклассовая
-            y_true_bin = label_binarize(y_true, classes=np.arange(n_classes))
-            try:
-                metrics['roc_auc'] = roc_auc_score(y_true_bin, y_prob, average='weighted', multi_class='ovr')
-            except ValueError:
-                metrics['roc_auc'] = 0.5
-
-    return metrics
+    cm = confusion_matrix(targets, preds, num_classes)
+    prf = precision_recall_f1(cm)
+    return {
+        "accuracy": float((preds == targets).mean()),
+        "precision": prf["precision"],
+        "recall": prf["recall"],
+        "f1": prf["f1"],
+        "roc_auc": roc_auc_score(targets, probs, num_classes),
+        "confusion_matrix": cm,
+        "targets": targets,
+        "preds": preds,
+        "probs": probs,
+    }
 
 
 def plot_confusion_matrix(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    title: str = "Confusion Matrix",
-    save_path: Optional[str] = None
-):
-    """
-    Визуализация матрицы неточностей.
+    cm: np.ndarray,
+    class_names: Sequence[str],
+    save_path: Path | str,
+    title: str = "Confusion matrix",
+    normalize: bool = False,
+) -> Path:
+    "Рисует матрицу ошибок в виде теплокарты с числовыми подписями"
+    save_path = Path(save_path)
+    matrix = cm.astype(float)
+    if normalize:
+        matrix = matrix / matrix.sum(axis=1, keepdims=True).clip(min=1e-12)
 
-    Использует:
-    - confusion_matrix из sklearn.metrics
-    - seaborn для тепловой карты
-    - matplotlib для отображения
-    """
-    cm = confusion_matrix(y_true, y_pred)
-    classes = np.unique(np.concatenate([y_true, y_pred]))
+    fig, ax = plt.subplots(figsize=(1.6 * len(class_names) + 2, 1.6 * len(class_names) + 1.5))
+    im = ax.imshow(matrix, cmap="Blues")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        xticklabels=classes,
-        yticklabels=classes,
-        cbar=True
-    )
-    plt.title(title, fontsize=14, fontweight='bold')
-    plt.xlabel('Predicted', fontsize=12)
-    plt.ylabel('True', fontsize=12)
-    plt.tight_layout()
+    ax.set_xticks(range(len(class_names)))
+    ax.set_yticks(range(len(class_names)))
+    ax.set_xticklabels(class_names)
+    ax.set_yticklabels(class_names)
+    ax.set_xlabel("Предсказанный класс")
+    ax.set_ylabel("Истинный класс")
+    ax.set_title(title)
 
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logger.info(f"Confusion matrix saved to {save_path}")
-
-    plt.show()
-    plt.close()
-
-
-def plot_training_history(history: Dict[str, List], title: str = "Training History",
-                         save_path: Optional[str] = None):
-    """
-    Визуализация истории обучения.
-
-    Args:
-        history: Словарь с историей
-        title: Заголовок графика
-        save_path: Путь для сохранения
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-
-    # График потерь
-    axes[0].plot(history['train_loss'], label='Train Loss', linewidth=2)
-    axes[0].plot(history['val_loss'], label='Validation Loss', linewidth=2)
-    axes[0].set_xlabel('Epoch')
-    axes[0].set_ylabel('Loss')
-    axes[0].set_title('Loss', fontsize=14, fontweight='bold')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    # График метрик (если есть)
-    metrics_to_plot = ['accuracy', 'precision', 'recall', 'f1']
-    has_metrics = any(m in history for m in metrics_to_plot)
-
-    if has_metrics:
-        for metric in metrics_to_plot:
-            if metric in history:
-                axes[1].plot(history[metric], label=metric.capitalize(), linewidth=2)
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('Value')
-        axes[1].set_title('Metrics', fontsize=14, fontweight='bold')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-    else:
-        # Если метрик нет, показываем MSE
-        if 'train_mse' in history and 'val_mse' in history:
-            axes[1].plot(history['train_mse'], label='Train MSE', linewidth=2)
-            axes[1].plot(history['val_mse'], label='Validation MSE', linewidth=2)
-            axes[1].set_xlabel('Epoch')
-            axes[1].set_ylabel('MSE')
-            axes[1].set_title('Mean Squared Error', fontsize=14, fontweight='bold')
-            axes[1].legend()
-            axes[1].grid(True, alpha=0.3)
-        else:
-            axes[1].axis('off')
-
-    plt.suptitle(title, fontsize=16, fontweight='bold')
-    plt.tight_layout()
-
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logger.info(f"Plot saved to {save_path}")
-
-    plt.show()
-    plt.close()
+    threshold = matrix.max() / 2.0
+    fmt = ".2f" if normalize else "d"
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            value = matrix[i, j] if normalize else int(cm[i, j])
+            ax.text(
+                j, i, format(value, fmt),
+                ha="center", va="center",
+                color="white" if matrix[i, j] > threshold else "black",
+            )
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=120)
+    plt.close(fig)
+    return save_path
 
 
-# ==================== ОБУЧЕНИЕ ЛОГИСТИЧЕСКОЙ РЕГРЕССИИ ====================
-
-def train_logistic_regression_torch(
-    model: LogisticRegressionMulticlass,
+def train_logistic_regression(
+    model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    epochs: int = 100,
-    lr: float = 0.01,
-    use_regularization: bool = True,
-    early_stopping: Optional[EarlyStopping] = None,
-    save_path: Optional[str] = None
-) -> Tuple[Dict[str, List], Dict[str, float]]:
-    """
-    Обучение логистической регрессии (PyTorch версия) с метриками.
-
-    Использует:
-    - accuracy() из utils для вычисления точности
-    - log_epoch() из utils для логирования
-    """
+    *,
+    num_classes: int,
+    epochs: int = 150,
+    lr: float = 0.1,
+    optimizer_name: str = "Adam",
+    l2_lambda: float = 0.0,
+    patience: int = 20,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> Dict[str, list]:
+    "Обучает softmax-регрессию с ранней остановкой по валидационному loss"
+    device = device or get_device()
+    model.to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'accuracy': [],
-        'precision': [],
-        'recall': [],
-        'f1': []
-    }
-
-    best_val_loss = float('inf')
-    best_state_dict = None
-    final_metrics = {}
-
-    logger.info(f"Starting training for {epochs} epochs...")
+    optimizer = build_optimizer(optimizer_name, model.parameters(), lr)
+    stopper = EarlyStopping(patience=patience)
+    history: Dict[str, list] = {"train_loss": [], "val_loss": [], "val_acc": []}
 
     for epoch in range(1, epochs + 1):
-        # Training
         model.train()
-        train_loss = 0.0
-        for X, y in train_loader:
+        running = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device).long().view(-1)
             optimizer.zero_grad()
-            logits = model(X)
-            y_target = y.squeeze().long()
-
-            loss = criterion(logits, y_target)
-            if use_regularization and hasattr(model, 'regularization_loss'):
-                loss += model.regularization_loss()
-
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            if l2_lambda:
+                loss = loss + l2_lambda * l2_penalty(model)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
+            running += criterion(logits, yb).item() * xb.size(0)
 
-        train_loss /= len(train_loader)
+        train_loss = running / len(train_loader.dataset)
+        val_metrics = evaluate_classification(model, val_loader, num_classes, device)
+        val_loss = _cross_entropy_on_loader(model, val_loader, device)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_metrics["accuracy"])
 
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        all_preds = []
-        all_labels = []
-        all_probs = []
+        if verbose and (epoch % 20 == 0 or epoch == 1):
+            logger.info(
+                "Эпоха %3d | train CE=%.4f | val CE=%.4f | val acc=%.4f",
+                epoch, train_loss, val_loss, val_metrics["accuracy"],
+            )
 
-        with torch.no_grad():
-            for X, y in val_loader:
-                logits = model(X)
-                y_target = y.squeeze().long()
-
-                loss = criterion(logits, y_target)
-                if use_regularization and hasattr(model, 'regularization_loss'):
-                    loss += model.regularization_loss()
-                val_loss += loss.item()
-
-                # Сохранение предсказаний
-                probs = torch.softmax(logits, dim=1)
-                preds = torch.argmax(logits, dim=1)
-
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(y_target.cpu().numpy())
-                all_probs.append(probs.cpu().numpy())
-
-        val_loss /= len(val_loader)
-
-        # Вычисление метрик
-        all_labels = np.array(all_labels)
-        all_preds = np.array(all_preds)
-        all_probs = np.vstack(all_probs) if all_probs else None
-
-        metrics = calculate_classification_metrics(all_labels, all_preds, all_probs)
-
-        # Сохранение истории
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['accuracy'].append(metrics['accuracy'])
-        history['precision'].append(metrics['precision'])
-        history['recall'].append(metrics['recall'])
-        history['f1'].append(metrics['f1'])
-
-        # Логирование (используем log_epoch из utils)
-        if epoch % 10 == 0:
-            log_msg = f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
-            for k, v in metrics.items():
-                log_msg += f", {k}={v:.4f}"
-            logger.info(log_msg)
-
-        # Сохранение лучшей модели
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state_dict = model.state_dict().copy()
-            if save_path:
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                torch.save(best_state_dict, save_path)
-
-        # Early stopping
-        if early_stopping and early_stopping(val_loss, epoch):
-            if best_state_dict is not None:
-                model.load_state_dict(best_state_dict)
-                logger.info("Restored best model state")
+        if stopper.step(val_loss, model, epoch):
+            logger.info(
+                "Ранняя остановка на эпохе %d (лучшая эпоха %d, val CE=%.4f)",
+                epoch, stopper.best_epoch, stopper.best_loss,
+            )
             break
 
-    # Финальные метрики
-    final_metrics = calculate_classification_metrics(all_labels, all_preds, all_probs)
-    logger.info("Final metrics:")
-    for k, v in final_metrics.items():
-        logger.info(f"  {k}: {v:.4f}")
-
-    return history, final_metrics
-
-
-# ==================== ДЕМОНСТРАЦИЯ ====================
-
-def demo_linear_regression():
-    """Демонстрация линейной регрессии с регуляризацией."""
-    print("1.1 ЛИНЕЙНАЯ РЕГРЕССИЯ С РЕГУЛЯРИЗАЦИЕЙ")
-
-    # Генерируем данные (используем make_regression_data из utils)
-    X, y = make_regression_data(n=500, source='random')
-
-    # Создаём датасет (используем RegressionDataset из utils)
-    dataset = RegressionDataset(X, y)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-
-    print(f'Размер датасета: {len(dataset)}')
-    print(f'Количество батчей train: {len(train_loader)}')
-    print(f'Количество батчей val: {len(val_loader)}')
-
-    # Создаем модель с регуляризацией
-    model = LinearRegressionManual(
-        in_features=X.shape[1],
-        l1_lambda=0.001,
-        l2_lambda=0.001
-    )
-
-    # Early stopping
-    early_stopping = EarlyStopping(patience=10, min_delta=1e-5)
-
-    # Обучение
-    history = train_linear_regression(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=100,
-        lr=0.1,
-        use_regularization=True,
-        early_stopping=early_stopping,
-        save_path='models/linreg_manual_with_reg.pth'
-    )
-
-    # Визуализация
-    plot_training_history(history, title="Linear Regression with L1/L2 Regularization",
-                         save_path='plots/linreg_history.png')
-
+    stopper.restore(model)
+    history["best_epoch"] = stopper.best_epoch or len(history["train_loss"])
     return history
 
 
-def demo_logistic_regression():
-    """Демонстрация логистической регрессии с метриками."""
-    print("1.2 ЛОГИСТИЧЕСКАЯ РЕГРЕССИЯ (МНОГОКЛАССОВАЯ)")
+@torch.no_grad()
+def _cross_entropy_on_loader(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    "Средняя кросс-энтропия модели на загрузчике"
+    model.eval()
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+    total, n = 0.0, 0
+    for xb, yb in loader:
+        logits = model(xb.to(device))
+        yb = yb.to(device).long().view(-1)
+        total += criterion(logits, yb).item()
+        n += xb.size(0)
+    return total / max(n, 1)
 
-    X, y = make_classification_data(n=800, source='random')
 
-    from sklearn.datasets import make_classification as sk_make
+def build_optimizer(name: str, params, lr: float) -> optim.Optimizer:
+    "Фабрика оптимизаторов: поддерживает SGD, Adam, RMSprop"
+    name = name.lower()
+    if name == "sgd":
+        return optim.SGD(params, lr=lr)
+    if name == "adam":
+        return optim.Adam(params, lr=lr)
+    if name == "rmsprop":
+        return optim.RMSprop(params, lr=lr)
+    raise ValueError(f"Неизвестный оптимизатор: {name!r}")
 
-    X_np, y_np = sk_make(
-	    n_samples=800,
-	    n_features=5,
-	    n_informative=3,
-	    n_redundant=1,
-	    n_classes=3,
-	    n_clusters_per_class=1,
-	    random_state=42
+
+#  Загрузчики из тензоров 
+def make_loaders(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    batch_size: int = 32,
+    val_ratio: float = 0.2,
+    seed: int = 42,
+) -> tuple[DataLoader, DataLoader]:
+    "Делит выборку на train/val и оборачивает в DataLoader."
+    n = X.shape[0]
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=generator)
+    n_val = int(n * val_ratio)
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    train_ds = TensorDataset(X[train_idx], y[train_idx])
+    val_ds = TensorDataset(X[val_idx], y[val_idx])
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
+
+
+#  Демонстрация 
+def demo_linear_regression() -> None:
+    "1.1 Регуляризация L1/L2 + early stopping"
+    from sklearn.datasets import make_regression
+    from sklearn.preprocessing import StandardScaler
+    from utils import plot_bars
+
+    print("\n1.1 Линейная регрессия: L1/L2-регуляризация и ранняя остановка")
+
+    n_features = 30
+    X_np, y_np = make_regression(
+        n_samples=80, n_features=n_features, n_informative=10, noise=15.0, random_state=0
+    )
+    X_np = StandardScaler().fit_transform(X_np)
+    y_np = (y_np - y_np.mean()) / y_np.std()
+    X = torch.tensor(X_np, dtype=torch.float32)
+    y = torch.tensor(y_np, dtype=torch.float32).unsqueeze(1)
+    train_loader, val_loader = make_loaders(X, y, batch_size=16, val_ratio=0.3)
+    device = get_device()
+
+    configs = {
+        "Без регуляризации": dict(l1_lambda=0.0, l2_lambda=0.0),
+        "L1 (λ=0.01)": dict(l1_lambda=0.01, l2_lambda=0.0),
+        "L1 (λ=0.05)": dict(l1_lambda=0.05, l2_lambda=0.0),
+        "L2 (λ=0.01)": dict(l1_lambda=0.0, l2_lambda=0.01),
+    }
+    val_curves: Dict[str, list] = {}
+    sparsity: Dict[str, float] = {}
+    print("\nСравнение регуляризаций (400 эпох, без ранней остановки):")
+    for name, reg in configs.items():
+        set_seed(0)
+        model = LinearRegressionModel(in_features=n_features)
+        history = train_linear_regression(
+            model, train_loader, val_loader,
+            epochs=400, lr=0.03, patience=10 ** 9, verbose=False, **reg,
+        )
+        train_mse = evaluate_regression(model, train_loader, device)["mse"]
+        val = evaluate_regression(model, val_loader, device)
+        weights = model.linear.weight.detach().cpu().numpy().ravel()
+        n_near_zero = int((np.abs(weights) < 1e-2).sum())
+        print(
+            f"  {name:20s} train MSE={train_mse:.4f}  val MSE={val['mse']:.4f}  "
+            f"R2={val['r2']:.3f}  |w|_1={np.abs(weights).sum():.2f}  "
+            f"почти нулевых весов={n_near_zero}/{n_features}"
+        )
+        val_curves[name] = history["val_loss"]
+        sparsity[name] = n_near_zero
+
+    plot_curves(
+        val_curves,
+        title="Линейная регрессия: валидационный MSE при разной регуляризации",
+        ylabel="Val MSE",
+        save_path=PLOTS_DIR / "linreg_regularization.png",
+        logy=True,
+    )
+    plot_bars(
+        sparsity,
+        title="Разреженность весов: L1 обнуляет больше признаков, чем L2",
+        ylabel=f"Число весов |w|<0.01 (из {n_features})",
+        save_path=PLOTS_DIR / "linreg_sparsity.png",
     )
 
-    X = torch.FloatTensor(X_np)
-    y = torch.FloatTensor(y_np).unsqueeze(1)
-
-    # Создаём датасет (используем ClassificationDataset из utils)
-    dataset = ClassificationDataset(X, y)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-
-    print(f'Размер датасета: {len(dataset)}')
-    print(f'Количество классов: {len(torch.unique(y))}')
-    print(f'Количество батчей train: {len(train_loader)}')
-    print(f'Количество батчей val: {len(val_loader)}')
-
-    # PyTorch версия
-    print("\n--- PyTorch версия ---")
-    model_torch = LogisticRegressionMulticlass(
-        in_features=X.shape[1],
-        num_classes=3,
-        l2_lambda=0.01
+    print("\nРанняя остановка (без регуляризации, patience=25):")
+    set_seed(0)
+    es_model = LinearRegressionModel(in_features=n_features)
+    es_history = train_linear_regression(
+        es_model, train_loader, val_loader, epochs=400, lr=0.03, patience=25, verbose=False
+    )
+    print(
+        f"  обучение остановлено на эпохе {len(es_history['train_loss'])} из 400, "
+        f"восстановлены веса лучшей эпохи {es_history['best_epoch']} "
+        f"(val MSE={evaluate_regression(es_model, val_loader, device)['mse']:.4f})"
+    )
+    plot_curves(
+        {"train MSE": es_history["train_loss"], "val MSE": es_history["val_loss"]},
+        title="Линейная регрессия: кривые обучения при ранней остановке",
+        ylabel="MSE",
+        save_path=PLOTS_DIR / "linreg_early_stopping.png",
+        logy=True,
     )
 
-    early_stopping = EarlyStopping(patience=10, min_delta=1e-4)
-
-    history_torch, metrics_torch = train_logistic_regression_torch(
-        model=model_torch,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=100,
-        lr=0.01,
-        use_regularization=True,
-        early_stopping=early_stopping,
-        save_path='models/logreg_torch_multiclass.pth'
+    set_seed(0)
+    final_model = LinearRegressionModel(in_features=n_features)
+    train_linear_regression(
+        final_model, train_loader, val_loader, epochs=400, lr=0.03, l2_lambda=0.01, verbose=False
+    )
+    model_path = MODELS_DIR / "linreg_regularized.pth"
+    torch.save(final_model.state_dict(), model_path)
+    print(
+        f"\nГрафики: linreg_regularization.png, linreg_sparsity.png, linreg_early_stopping.png"
+        f"\nМодель сохранена: {model_path.relative_to(BASE_DIR.parent)}"
     )
 
-    # Визуализация
-    plot_training_history(history_torch, title="Logistic Regression (PyTorch)",
-                         save_path='plots/logreg_torch_history.png')
 
-    # Визуализация матрицы неточностей
-    model_torch.eval()
-    all_preds = []
-    all_labels = []
+def demo_logistic_regression() -> None:
+    "1.2 Многоклассовая логистическая регрессия: метрики и confusion matrix"
+    from sklearn.datasets import make_classification
+    from sklearn.preprocessing import StandardScaler
 
-    with torch.no_grad():
-        for X, y in val_loader:
-            preds = model_torch.predict(X)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(y.squeeze().long().cpu().numpy())
+    print("\n1.2 Логистическая регрессия: многоклассовость, метрики, confusion matrix")
 
-    plot_confusion_matrix(
-        np.array(all_labels),
-        np.array(all_preds),
-        title="Confusion Matrix (PyTorch)",
-        save_path='plots/confusion_matrix_torch.png'
+    num_classes = 3
+    X_np, y_np = make_classification(
+        n_samples=600, n_features=8, n_informative=6, n_redundant=1,
+        n_classes=num_classes, n_clusters_per_class=1, random_state=42,
+    )
+    X_np = StandardScaler().fit_transform(X_np)
+    X = torch.tensor(X_np, dtype=torch.float32)
+    y = torch.tensor(y_np, dtype=torch.long)
+    train_loader, val_loader = make_loaders(X, y, batch_size=32)
+
+    set_seed(42)
+    model = LogisticRegressionModel(in_features=8, num_classes=num_classes)
+    history = train_logistic_regression(
+        model, train_loader, val_loader, num_classes=num_classes, epochs=150, lr=0.1
     )
 
-    print("\nИтоговые метрики (PyTorch):")
-    for k, v in metrics_torch.items():
-        print(f"  {k}: {v:.4f}")
+    device = get_device()
+    metrics = evaluate_classification(model, val_loader, num_classes, device)
+    print(
+        f"\nМетрики на валидации (macro): accuracy={metrics['accuracy']:.4f}, "
+        f"precision={metrics['precision']:.4f}, recall={metrics['recall']:.4f}, "
+        f"F1={metrics['f1']:.4f}, ROC-AUC={metrics['roc_auc']:.4f}"
+    )
 
-    return history_torch, metrics_torch
+    cm_path = plot_confusion_matrix(
+        metrics["confusion_matrix"],
+        class_names=[f"Класс {i}" for i in range(num_classes)],
+        save_path=PLOTS_DIR / "logreg_confusion_matrix.png",
+        title="Логистическая регрессия: confusion matrix на валидации",
+    )
+    loss_path = plot_curves(
+        {"train CE": history["train_loss"], "val CE": history["val_loss"]},
+        title="Логистическая регрессия: кривые обучения",
+        ylabel="Cross-Entropy",
+        save_path=PLOTS_DIR / "logreg_training.png",
+    )
+    print(f"Графики сохранены: {cm_path.name}, {loss_path.name}")
+
+    model_path = MODELS_DIR / "logreg_multiclass.pth"
+    torch.save(model.state_dict(), model_path)
+    print(f"Модель сохранена: {model_path.relative_to(BASE_DIR.parent)}")
 
 
-def main():
-    """Основная функция для демонстрации."""
-    os.makedirs('models', exist_ok=True)
-    os.makedirs('plots', exist_ok=True)
-
-    # Демонстрация линейной регрессии
+def main() -> None:
+    set_seed(42)
+    logger.info("Устройство: %s", get_device())
     demo_linear_regression()
-
-    # Демонстрация логистической регрессии
     demo_logistic_regression()
-
-    print("\n" + "="*60)
-    print("ВСЕ ДЕМОНСТРАЦИИ ЗАВЕРШЕНЫ УСПЕШНО!")
-    print("="*60)
+    print("\nЗадание 1 выполнено.")
 
 
 if __name__ == "__main__":
